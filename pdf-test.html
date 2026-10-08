@@ -1,0 +1,87 @@
+<!doctype html><meta charset="utf-8"><pre id="out">loading</pre><script>function pdfStringDecode(s){const t=s.replace(/\\([\\()])/g,'$1').replace(/\\n/g,'\n').replace(/\\r/g,'\r').replace(/\\t/g,'\t').replace(/\\([0-7]{1,3})/g,(_,o)=>String.fromCharCode(parseInt(o,8)));const bytes=new Uint8Array(t.length);for(let i=0;i<t.length;i++)bytes[i]=t.charCodeAt(i)&255;if(bytes.length>=2&&bytes[0]===0xfe&&bytes[1]===0xff)return new TextDecoder('utf-16be').decode(bytes.slice(2));if(bytes.length>=4&&bytes.length%2===0){let zeroPairs=0;for(let i=0;i+1<bytes.length;i+=2)if(bytes[i]===0||bytes[i+1]===0)zeroPairs++;if(zeroPairs/Math.floor(bytes.length/2)>=0.30)return new TextDecoder('utf-16be').decode(bytes)}return t}
+function pdfHexBytes(s){s=s.replace(/\s+/g,'');if(s.length%2)s+='0';const a=[];for(let i=0;i<s.length;i+=2){const n=parseInt(s.slice(i,i+2),16);if(Number.isFinite(n))a.push(n)}return new Uint8Array(a)}
+function pdfDecodeHexText(s){const b=pdfHexBytes(s);if(b.length>=2&&b[0]===0xfe&&b[1]===0xff){let out='';for(let i=2;i+1<b.length;i+=2)out+=String.fromCharCode((b[i]<<8)|b[i+1]);return out}return new TextDecoder('utf-8').decode(b)}
+function pdfAscii85Decode(data){const src=new TextDecoder('latin1').decode(data).replace(/\s+/g,'');let end=src.indexOf('~>');const clean=(end>=0?src.slice(0,end):src).replace(/^<~/,'');const out=[];let group=[];for(const ch of clean){if(ch==='z'&&group.length===0){out.push(0,0,0,0);continue}const code=ch.charCodeAt(0)-33;if(code<0||code>84)continue;group.push(code);if(group.length===5){let n=0;for(const v of group)n=n*85+v;out.push((n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255);group=[]}}if(group.length>1){const orig=group.length;while(group.length<5)group.push(84);let n=0;for(const v of group)n=n*85+v;const tmp=[(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255];out.push(...tmp.slice(0,orig-1))}return new Uint8Array(out)}
+async function pdfInflate(data){if(typeof DecompressionStream==='undefined')throw new Error('This browser cannot decompress PDF streams.');const ds=new DecompressionStream('deflate');return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(ds)).arrayBuffer())}
+function pdfDictRef(dict,key){const m=dict.match(new RegExp('\\/'+key+'\\s+(?:\\[\\s*)?(\\d+)\\s+(\\d+)\\s+R'));return m?Number(m[1]):null}
+function pdfName(dict,key){const m=dict.match(new RegExp('\\/'+key+'\\s+/(\\S+)'));return m?m[1]:''}
+async function pdfDecodeStream(raw,dict,objects){let data=raw;const filters=[...dict.matchAll(/\/(ASCII85Decode|A85|ASCIIHexDecode|AHx|FlateDecode|Fl)\b/g)].map(m=>m[1]);for(const filter of filters){if(filter==='ASCII85Decode'||filter==='A85')data=pdfAscii85Decode(data);else if(filter==='ASCIIHexDecode'||filter==='AHx'){const t=new TextDecoder('latin1').decode(data).replace(/\s+/g,'').replace(/>.*$/,'');data=pdfHexBytes(t)}else if(filter==='FlateDecode'||filter==='Fl')data=await pdfInflate(data)}return data}
+async function pdfParseObjects(bytes){const latin=new TextDecoder('latin1').decode(bytes),objects=new Map();const re=/(\d+)\s+(\d+)\s+obj\b/g;let m;while((m=re.exec(latin))){const num=Number(m[1]),bodyStart=re.lastIndex,end=latin.indexOf('endobj',bodyStart);if(end<0)break;const body=latin.slice(bodyStart,end),sm=body.indexOf('stream');let dict=body,stream=null;if(sm>=0){dict=body.slice(0,sm);let a=bodyStart+sm+6;if(latin[a]==='\r')a++;if(latin[a]==='\n')a++;let len=null;const lm=dict.match(/\/Length\s+(\d+)\b/);if(lm)len=Number(lm[1]);let e=len!=null?a+len:latin.indexOf('endstream',a);if(e<0||e>end){re.lastIndex=end+6;continue}stream=bytes.slice(a,e)}objects.set(num,{num,dict,stream});re.lastIndex=end+6}return objects}
+function pdfRefIds(value){const out=[];if(!value)return out;const rr=/(\d+)\s+(\d+)\s+R/g;let m;while((m=rr.exec(value)))out.push(Number(m[1]));return out}
+function pdfResolveDict(objects,dict,key){const ref=pdfDictRef(dict,key);return ref?objects.get(ref)?.dict||'':dict}
+function pdfPageContentRefs(pageDict){const m=pageDict.match(/\/Contents\s+((?:\d+\s+\d+\s+R)|\[[\s\S]*?\])/);return m?pdfRefIds(m[1]):[]}
+function pdfCollectFontMaps(objects,resources,fontMaps){if(!resources)return;let fontBlock='';const direct=resources.match(/\/Font\s+(\d+)\s+(\d+)\s+R/);if(direct)fontBlock=objects.get(Number(direct[1]))?.dict||'';else{const inline=resources.match(/\/Font\s*<<([\s\S]*?)>>/);if(inline)fontBlock=inline[1]}if(!fontBlock)return;for(const q of fontBlock.matchAll(/\/([A-Za-z0-9+_.#-]+)\s+(\d+)\s+(\d+)\s+R/g)){const fontObj=objects.get(Number(q[2]));if(!fontObj)continue;const refs=[];const directTU=pdfDictRef(fontObj.dict,'ToUnicode');if(directTU)refs.push(directTU);const dm=fontObj.dict.match(/\/DescendantFonts\s*\[([\s\S]*?)\]/);if(dm){const rr=/(\d+)\s+(\d+)\s+R/g;let x;while((x=rr.exec(dm[1])))refs.push(Number(x[1]));}for(const rid of refs){const target=objects.get(rid);if(!target)continue;const tu=pdfDictRef(target.dict,'ToUnicode');const cmapObj=objects.get(tu||rid);if(cmapObj?.decoded){const map=pdfParseCMap(cmapObj.decoded);if(map.size)fontMaps.set(q[1],map);}}}}
+function pdfParseCMap(cmap){const map=new Map();if(!cmap)return map;const s=new TextDecoder('latin1').decode(cmap);let m;const ranges=[];const rangeRe=/(\d+)\s+begincodespacerange([\s\S]*?)endcodespacerange/g;while((m=rangeRe.exec(s))){const rr=/<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>/g;let x;while((x=rr.exec(m[2])))ranges.push([parseInt(x[1],16),parseInt(x[2],16),x[1].length/2]);}const charRe=/(\d+)\s+beginbfchar([\s\S]*?)endbfchar/g;while((m=charRe.exec(s))){const rr=/<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>/g;let x;while((x=rr.exec(m[2]))){const code=parseInt(x[1],16),hex=x[2];let v='';for(let i=0;i<hex.length;i+=4)v+=String.fromCharCode(parseInt(hex.slice(i,i+4),16));map.set(code,v);}}const rangeBlocks=/(\d+)\s+beginbfrange([\s\S]*?)endbfrange/g;while((m=rangeBlocks.exec(s))){const lines2=m[2].match(/<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+(?:<([0-9A-Fa-f]+)>|\[([^\]]+)\])/g)||[];for(const line of lines2){const q=line.match(/<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+(?:<([0-9A-Fa-f]+)>|\[([^\]]+)\])/);if(!q)continue;const a=parseInt(q[1],16),b=parseInt(q[2],16);if(q[3]){let base=parseInt(q[3],16);for(let c=a;c<=b;c++,base++){let h=base.toString(16).padStart(q[3].length,'0'),v='';for(let z=0;z<h.length;z+=4)v+=String.fromCharCode(parseInt(h.slice(z,z+4),16));map.set(c,v);}}else{const vals=(q[4].match(/<([0-9A-Fa-f]+)>/g)||[]).map(x=>x.slice(1,-1));for(let c=a;c<=b&&c-a<vals.length;c++){let h=vals[c-a],v='';for(let z=0;z<h.length;z+=4)v+=String.fromCharCode(parseInt(h.slice(z,z+4),16));map.set(c,v);}}}}map.maxCodeBytes=ranges.reduce((n,r)=>Math.max(n,r[2]),1);return map}
+function pdfDecodeWithMap(raw,map,codeBytes=1){if(!map||!map.size)return raw;let out='';for(let i=0;i<raw.length;){let matched=false;for(let n=Math.min(map.maxCodeBytes||1,raw.length-i);n>=1;n--){let code=0;for(let j=0;j<n;j++)code=(code<<8)|raw.charCodeAt(i+j);if(map.has(code)){out+=map.get(code);i+=n;matched=true;break}}if(!matched){out+=raw[i];i++}}return out}
+function pdfTextTokenDecode(tok,fontMap){
+  const isHex=tok[0]==='<';
+  const raw=isHex?pdfHexBytes(tok.slice(1,-1)):pdfStringDecode(tok.slice(1,-1));
+  // Type0/Identity-H PDF text is a sequence of character codes, not UTF-8.
+  // Apply the PDF font's ToUnicode CMap before any generic byte decoding.
+  if(fontMap){
+    const mapped=pdfDecodeWithMap(new TextDecoder('latin1').decode(raw),fontMap);
+    if(mapped&&!(mapped.includes('\uFFFD'))&&!(mapped.includes('�')))return mapped;
+  }
+  if(isHex)return pdfDecodeHexText(tok.slice(1,-1));
+  return raw;
+}
+
+function pdfExtractTextOperators(txt,fontMaps){
+  const out=[];let current='';
+  const tokenRe=/\/([A-Za-z0-9+_.-]+)\s+[-+]?\d*\.?\d+\s+Tf|\((?:\\.|[^\\)])*\)|<(?!<)(?:[0-9A-Fa-f\s]+)>|\[(?:[\s\S]*?)\]\s*TJ|T\*|\'|\"|\bTj\b/g;let m;
+  while((m=tokenRe.exec(txt))){
+    const tok=m[0];
+    if(/Tf$/.test(tok)){const q=tok.match(/^\/(\S+)\s/);current=q?q[1]:current;continue}
+    if(tok==='T*'||tok==='\''||tok==='"'){out.push('\n');continue}
+    if(tok.endsWith('Tj'))continue;
+    if(tok[0]==='('||tok[0]==='<'){
+      let j=tokenRe.lastIndex;while(j<txt.length&&/\s/.test(txt[j]))j++;
+      if(txt.slice(j,j+2)==='Tj'||txt[j]==='\''||txt[j]==='"')out.push(pdfTextTokenDecode(tok,fontMaps.get(current)));
+      continue;
+    }
+    if(tok[0]==='['){
+      const inner=tok.slice(1,tok.lastIndexOf(']'));const rr=/\((?:\\.|[^\\)])*\)|<(?!<)(?:[0-9A-Fa-f\s]+)>/g;let x;
+      while((x=rr.exec(inner)))out.push(pdfTextTokenDecode(x[0],fontMaps.get(current)));
+      out.push('\n');
+    }
+  }
+  return out;
+}
+function pdfTextQuality(text){
+  if(!text)return -1;
+  const replacement=(text.match(/[\uFFFD�□]/g)||[]).length;
+  const controls=(text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g)||[]).length;
+  const letters=(text.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/g)||[]).length;
+  const spaces=(text.match(/\s/g)||[]).length;
+  const printable=(text.match(/[\x20-\x7EÀ-ÖØ-öø-ÿ—–’‘“”]/g)||[]).length;
+  return printable + letters*2 + spaces*0.2 - replacement*25 - controls*25;
+}
+async function readPdfText(file){
+ const bytes=new Uint8Array(await file.arrayBuffer()),latin=new TextDecoder('latin1').decode(bytes);if(!latin.startsWith('%PDF-'))throw new Error('Invalid PDF file.');
+ const objects=await pdfParseObjects(bytes);for(const o of objects.values()){if(o.stream){try{o.decoded=await pdfDecodeStream(o.stream,o.dict,objects)}catch(_){o.decoded=null}}}
+ const fontMaps=new Map(),pageStreams=[];
+ for(const page of objects.values()){
+   if(!/\/Type\s*\/Page\b/.test(page.dict))continue;
+   let resources=pdfResolveDict(objects,page.dict,'Resources');
+   if(!resources){let parent=pdfDictRef(page.dict,'Parent'),guard=0;while(parent&&guard++<8){const pd=objects.get(parent)?.dict||'';resources=pdfResolveDict(objects,pd,'Resources');if(resources)break;parent=pdfDictRef(pd,'Parent')}}
+   pdfCollectFontMaps(objects,resources,fontMaps);
+   for(const ref of pdfPageContentRefs(page.dict)){const co=objects.get(ref);if(co?.decoded)pageStreams.push(co.decoded)}
+ }
+ const mapped=[],raw=[],hex=[];
+ for(const data of pageStreams){
+   const txt=new TextDecoder('latin1').decode(data);
+   if(!/\bBT\b/.test(txt)||!(/\bTj\b|\bTJ\b/.test(txt)))continue;
+   mapped.push(...pdfExtractTextOperators(txt,fontMaps));
+   const rr=/\((?:\\.|[^\\)])*\)\s*Tj/g;let x;
+   while((x=rr.exec(txt)))raw.push(pdfStringDecode(x[0].slice(1,-3)));
+   const hr=/<(?!<)(?:[0-9A-Fa-f\s]+)>\s*Tj/g;while((x=hr.exec(txt)))hex.push(pdfDecodeHexText(x[0].slice(1,-3)));
+ }
+ const candidates=[mapped.join('').replace(/\u0000/g,'').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim(),raw.join('\n').trim(),hex.join('\n').trim()];
+ candidates.sort((a,b)=>pdfTextQuality(b)-pdfTextQuality(a));
+ const text=candidates[0];
+ if(!text||pdfTextQuality(text)<20)throw new Error('No readable/selectable text was found in this PDF. Scanned/image-only PDFs require OCR.');
+ return text;
+}
+
+
+(async()=>{try{const r=await fetch("/Tougher%20Than%20The%20Rest%20Lyrics.pdf");const b=await r.blob();const t=await readPdfText(b);document.getElementById("out").textContent=t}catch(e){document.getElementById("out").textContent="ERR:"+e.stack}})();</script>
